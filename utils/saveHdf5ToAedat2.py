@@ -1,5 +1,4 @@
 import sys, argparse
-from dv import AedatFile
 import numpy as np
 from numpy import uint32, int32, int64, int16
 from tqdm import tqdm
@@ -52,6 +51,10 @@ def my_logger(name):
     return logger
 
 log = my_logger(__name__)
+tot_len_jaer_events = 0
+ldvs = 0
+limu = 0
+nfr = 0
 
 class Struct:
     pass
@@ -86,6 +89,9 @@ def main(argv=None):
                              'and 8 gravities to encode AEDAT-2.0 values')
     parser.add_argument('--no_frame', dest='no_frame', action='store_true',
                         help='Do not process APS sample frames (which are very slow to extract)')
+    parser.add_argument('--chunk_size', type=int, default=100000000,
+                        help='Specify how many events read per step (the hdf5 might have too many events and '
+                             'cannot be finished reading in one time)')
     args, filelist = parser.parse_known_args()  # filelist is list [] of files to be converted
 
     if args.verbose:
@@ -143,11 +149,7 @@ def main(argv=None):
         if po.suffix is None or (not po.suffix == '.aedat' and not po.suffix == '.aedat2'):
             log.warning(
                 f'output file {po} does not have .aedat or .aedat2 extension; are you sure this is what you want?')
-        events = dict()
-        h5f_location = h5py.File(str(file), 'r')
-        h5f = h5f_location
-        for dset_str in ['p', 'x', 'y', 't']:
-            events[dset_str] = h5f['events/{}'.format(dset_str)]
+
 
         # Define output struct
         out = Struct()
@@ -183,86 +185,109 @@ def main(argv=None):
         out.data.imu6.temperature = []
         out.data.imu6.timeStamp = []
 
+        # Initialize statics variable for every new file
+        global tot_len_jaer_events
+        global ldvs
+        global limu
+        global nfr
+        tot_len_jaer_events = 0
+        ldvs = 0
+        limu = 0
+        nfr = 0
+
         data = {'aedat': out}
         # loop through the "events" stream
         log.debug(f'loading events to memory')
         # https://gitlab.com/inivation/dv/dv-python
-        events = np.hstack([packet for packet in f['events'].numpy()])  # load events to np array
-        out.data.dvs.timeStamp = events['timestamp']  # int64
-        out.data.dvs.x = events['x']  # int16
-        out.data.dvs.y = events['y']  # int16
-        out.data.dvs.polarity = events['polarity']  # int8
+        events = dict()
+        h5f = h5py.File(str(file), 'r')
+        events_in_total = len(h5f['events']['t'])
+        file_start_timestamp = h5f['events']['t'][0]
+        events_num_section_step = args.chunk_size
+        # events_in_total = events_num_section_step * 5
+        for events_num_section_start in range(0, events_in_total, events_num_section_step):
+            events_num_section_end = events_num_section_start + events_num_section_step
+            for dset_str in ['p', 'x', 'y', 't']:
+                events[dset_str] = h5f['events/{}'.format(dset_str)][events_num_section_start:events_num_section_end]
+            # events = np.hstack([packet for packet in f['events'].numpy()])  # load events to np array
+            out.data.dvs.timeStamp = events['t']  # int64
+            out.data.dvs.x = events['x']  # int16
+            out.data.dvs.y = events['y']  # int16
+            out.data.dvs.polarity = events['p']  # int8
 
-        log.info(f'{len(out.data.dvs.timeStamp)} DVS events')
+            log.info(f'Read {len(out.data.dvs.timeStamp)} DVS events')
+            log.info(f'{events_in_total - events_num_section_start - len(out.data.dvs.timeStamp)} DVS events left')
 
-        def generator():
-            while True:
-                yield
+            def generator():
+                while True:
+                    yield
 
-        # loop through the "frames" stream
-        if not args.no_frame:
-            log.debug(f'loading frames to memory')
-            with tqdm(generator(), desc='frames', unit=' fr', maxinterval=1) as pbar:
-                for frame in (f['frames']):
-                    out.data.frame.samples.append(
-                        np.array(frame.image,
-                                 dtype=np.uint8))  # frame.image is ndarray(h,w,1) with 0-255 values ?? ADC has larger range, maybe clipped
-                    out.data.frame.position.append(frame.position)
-                    out.data.frame.sizeAll.append(frame.size)
-                    out.data.frame.timeStamp.append(frame.timestamp)
-                    out.data.frame.frameStart.append(frame.timestamp_start_of_frame)
-                    out.data.frame.frameEnd.append(frame.timestamp_end_of_frame)
-                    out.data.frame.expStart.append(frame.timestamp_start_of_exposure)
-                    out.data.frame.expEnd.append(frame.timestamp_end_of_exposure)
-                    pbar.update(1)
+            # loop through the "frames" stream
+            if not args.no_frame:
+                log.debug(f'loading frames to memory')
+                with tqdm(generator(), desc='frames', unit=' fr', maxinterval=1) as pbar:
+                    for frame in (f['frames']):
+                        out.data.frame.samples.append(
+                            np.array(frame.image,
+                                     dtype=np.uint8))  # frame.image is ndarray(h,w,1) with 0-255 values ?? ADC has larger range, maybe clipped
+                        out.data.frame.position.append(frame.position)
+                        out.data.frame.sizeAll.append(frame.size)
+                        out.data.frame.timeStamp.append(frame.timestamp)
+                        out.data.frame.frameStart.append(frame.timestamp_start_of_frame)
+                        out.data.frame.frameEnd.append(frame.timestamp_end_of_frame)
+                        out.data.frame.expStart.append(frame.timestamp_start_of_exposure)
+                        out.data.frame.expEnd.append(frame.timestamp_end_of_exposure)
+                        pbar.update(1)
 
-            # Permute images via numpy
-            tmp = np.transpose(np.squeeze(np.array(out.data.frame.samples)), (1, 2, 0))  # make the frames x,y,frames
-            out.data.frame.numDiffImages = tmp.shape[2]
-            out.data.frame.size = out.data.frame.sizeAll[0]
-            out.data.frame.samples = tmp  # leave frames as numpy array
-            log.info(f'{out.data.frame.numDiffImages} frames with size {out.data.frame.size}')
+                # Permute images via numpy
+                tmp = np.transpose(np.squeeze(np.array(out.data.frame.samples)), (1, 2, 0))  # make the frames x,y,frames
+                out.data.frame.numDiffImages = tmp.shape[2]
+                out.data.frame.size = out.data.frame.sizeAll[0]
+                out.data.frame.samples = tmp  # leave frames as numpy array
+                log.info(f'{out.data.frame.numDiffImages} frames with size {out.data.frame.size}')
 
-        # # loop through the "imu" stream
-        if not args.no_imu:
-            log.debug(f'loading IMU samples to memory')
+            # # loop through the "imu" stream
+            if not args.no_imu:
+                log.debug(f'loading IMU samples to memory')
 
-            with tqdm(generator(), desc='IMU', unit=' sample') as pbar:
-                for i in (f['imu']):
-                    if not imu_scale_warning_printed and imu_gyro_scale == GYRO_FULL_SCALE_DEG_PER_SEC_DEFAULT and imu_accel_scale == ACCEL_FULL_SCALE_M_PER_S_SQ_DEFAULT:
-                        log.warning(
-                            f'IMU sample found: IMU samples will be converted to jAER AEDAT-2.0 assuming default full scale {GYRO_FULL_SCALE_DEG_PER_SEC_DEFAULT} deg/s rotation and {ACCEL_FULL_SCALE_M_PER_S_SQ_DEFAULT}g acceleration. Use --imu option to change output scaling.')
-                        imu_scale_warning_printed = True
-                    a = i.accelerometer
-                    g = i.gyroscope
-                    m = i.magnetometer
-                    out.data.imu6.accelX.append(a[0])
-                    out.data.imu6.accelY.append(a[1])
-                    out.data.imu6.accelZ.append(a[2])
-                    out.data.imu6.gyroX.append(g[0])
-                    out.data.imu6.gyroY.append(g[1])
-                    out.data.imu6.gyroZ.append(g[2])
-                    out.data.imu6.temperature.append(i.temperature)
-                    out.data.imu6.timeStamp.append(i.timestamp)
-                    pbar.update(1)
-            log.info(f'{len(out.data.imu6.accelX)} IMU samples')
+                with tqdm(generator(), desc='IMU', unit=' sample') as pbar:
+                    for i in (f['imu']):
+                        if not imu_scale_warning_printed and imu_gyro_scale == GYRO_FULL_SCALE_DEG_PER_SEC_DEFAULT and imu_accel_scale == ACCEL_FULL_SCALE_M_PER_S_SQ_DEFAULT:
+                            log.warning(
+                                f'IMU sample found: IMU samples will be converted to jAER AEDAT-2.0 assuming default full scale {GYRO_FULL_SCALE_DEG_PER_SEC_DEFAULT} deg/s rotation and {ACCEL_FULL_SCALE_M_PER_S_SQ_DEFAULT}g acceleration. Use --imu option to change output scaling.')
+                            imu_scale_warning_printed = True
+                        a = i.accelerometer
+                        g = i.gyroscope
+                        m = i.magnetometer
+                        out.data.imu6.accelX.append(a[0])
+                        out.data.imu6.accelY.append(a[1])
+                        out.data.imu6.accelZ.append(a[2])
+                        out.data.imu6.gyroX.append(g[0])
+                        out.data.imu6.gyroY.append(g[1])
+                        out.data.imu6.gyroZ.append(g[2])
+                        out.data.imu6.temperature.append(i.temperature)
+                        out.data.imu6.timeStamp.append(i.timestamp)
+                        pbar.update(1)
+                log.info(f'{len(out.data.imu6.accelX)} IMU samples')
 
-        # Add counts of jAER events
-        out.data.dvs.numEvents = len(out.data.dvs.x)
-        out.data.imu6.numEvents = len(out.data.imu6.accelX) * 7 if not args.no_imu else 0
-        out.data.frame.numEvents = (2 * width * height) * (out.data.frame.numDiffImages) if not args.no_frame else 0
+            # Add counts of jAER events
+            width = 640
+            height = 480
+            out.data.dvs.numEvents = len(out.data.dvs.x)
+            out.data.imu6.numEvents = len(out.data.imu6.accelX) * 7 if not args.no_imu else 0
+            out.data.frame.numEvents = (2 * width * height) * (out.data.frame.numDiffImages) if not args.no_frame else 0
 
-        export_aedat_2(args, out, po, height=height)
+            if(events_num_section_start == 0):
+                export_aedat_2(args, out, po, height=height, starttimestamp=file_start_timestamp)
+            else:
+                export_aedat_2(args, out, po, height=height, appendevents=True, starttimestamp=file_start_timestamp)
 
     log.debug('done')
 
-    ev_data_file = argv[1]
-    output_aedat_file = argv[2]
-    print(ev_data_file)
-
-
-
-def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_DEG_PER_SEC_DEFAULT, accel_scale=ACCEL_FULL_SCALE_M_PER_S_SQ_DEFAULT):
+def export_aedat_2(args, out, filename, starttimestamp, height=260,
+                   gyro_scale=GYRO_FULL_SCALE_DEG_PER_SEC_DEFAULT,
+                   accel_scale=ACCEL_FULL_SCALE_M_PER_S_SQ_DEFAULT,
+                   appendevents=False):
     """
     This function exports data to a .aedat file.
     The .aedat file format is documented here:
@@ -275,30 +300,37 @@ def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_D
     @param accel_scale: the full scale value of acceleratometer in m/s^2
     """
 
+    global tot_len_jaer_events
+    global ldvs
+    global limu
+    global nfr
     num_total_events = out.data.dvs.numEvents + out.data.imu6.numEvents + out.data.frame.numEvents
     printed_stats_first_frame=False
 
 
     file_path=Path(filename)
     try:
-        f=open(filename, 'wb')
+        f=open(filename, 'ab')
     except IOError as x:
         log.error(f'could not open {file_path.absolute()} for output (maybe opened in jAER already?): {str(x)}')
     else:
         with f:
-            # Simple - events only - assume DAVIS
-            log.debug(f'saving {file_path.absolute()}')
+            if(appendevents == False):
+                # Simple - events only - assume DAVIS
+                log.debug(f'saving {file_path.absolute()}')
 
-            # CRLF \r\n is needed to not break header parsing in jAER
-            f.write(b'#!AER-DAT2.0\r\n')
-            f.write(b'# This is a raw AE data file created by saveaerdat.m\r\n')
-            f.write(b'# Data format is int32 address, int32 timestamp (8 bytes total), repeated for each event\r\n')
-            f.write(b'# Timestamps tick is 1 us\r\n')
+                # CRLF \r\n is needed to not break header parsing in jAER
+                f.write(b'#!AER-DAT2.0\r\n')
+                f.write(b'# This is a raw AE data file created from hdf5 (DSEC dataset)\r\n')
+                f.write(b'# Data format is int32 address, int32 timestamp (8 bytes total), repeated for each event\r\n')
+                f.write(b'# Timestamps tick is 1 us\r\n')
 
-            # Put the source in NEEDS DOING PROPERLY
-            f.write(b'# AEChip: DAVI346\r\n')
+                # Put the source in NEEDS DOING PROPERLY
+                f.write(b'# AEChip: Prophese Gen 3.1 (VGA)\r\n')
 
-            f.write(b'# End of ASCII Header\r\n')
+                f.write(b'# End of ASCII Header\r\n')
+            else:
+                log.debug(f'appending events to {file_path.absolute()}')
 
             # DAVIS
             # In the 32-bit address:
@@ -333,7 +365,8 @@ def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_D
             dvs_addr = (y | x | pol | (dvsType<<apsDvsImuTypeShift)).astype(uint32)  # clear MSB for DVS event https://inivation.github.io/inivation-docs/Software%20user%20guides/AEDAT_file_formats#bit-31
             dvs_timestamps = np.array(out.data.dvs.timeStamp).astype(int64)  # still int64 from DV
 
-            # copied from jAER for IMU sample scaling https://github.com/SensorsINI/jaer/blob/master/src/eu/seebetter/ini/chips/davis/imu/IMUSample.java
+            # copied from jAER for IMU sample scaling
+            # https://github.com/SensorsINI/jaer/blob/master/src/eu/seebetter/ini/chips/davis/imu/IMUSample.java
             accelSensitivityScaleFactorGPerLsb = 1/8192.
             gyroSensitivityScaleFactorDegPerSecPerLsb = 1/65.5
             temperatureScaleFactorDegCPerLsb = 1/340.
@@ -382,6 +415,10 @@ def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_D
             if args.no_imu and args.no_frame: # TODO add frames condition
                 all_timestamps=dvs_timestamps
                 all_addr=dvs_addr
+                ldvs += len(dvs_timestamps)
+                limu += 0
+                nfr += 0
+                tot_len_jaer_events += ldvs
             else:
                 # Make the IMU and frame data into timestamp and encoded AER addr arrays, then
                 # sort them together
@@ -410,15 +447,15 @@ def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_D
                 # And we need to insert the frame double reset/read samples to the jAER stream
                 # That means a slow iteration over all timestamps to take things in order.
                 # At least each list of timestamps is in order already
-                ldvs = len(dvs_timestamps)
-                limu = len(imu_timestamps)
-                nfr=len(fr_timestamp)
+                ldvs += len(dvs_timestamps)
+                limu += len(imu_timestamps)
+                nfr+=len(fr_timestamp)
                 hw=(out.data.frame.size) if nfr>0 else (0,0)  # reset and signal samples from DDS readout
                 height=hw[1]
                 width=hw[0]
                 fr_len=height*width # reset + signal samples
                 # Add +4 exposure start/end and readout start/end events to total
-                tot_len_jaer_events=ldvs+limu+(nfr*(fr_len*2))
+                tot_len_jaer_events+=ldvs+limu+(nfr*(fr_len*2))
                 all_timestamps=np.zeros(tot_len_jaer_events,dtype=int64)
                 all_addr=np.zeros(tot_len_jaer_events,dtype=uint32)
                 max_len=np.max([ldvs, limu,nfr])
@@ -495,7 +532,7 @@ def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_D
 
             # DV uses int64 timestamps in us, but jaer uses int32, let's subtract the smallest timestamp from everyone
             # that will start the converted recording at time 0
-            all_timestamps = all_timestamps - all_timestamps[0]
+            all_timestamps = all_timestamps - starttimestamp
             all_timestamps = all_timestamps.astype(int32)  # cast to int32...
 
             output = np.zeros([2 * len(all_addr)], dtype=uint32)  # allocate horizontal vector to hold output data
@@ -511,7 +548,10 @@ def export_aedat_2(args, out, filename, height=260, gyro_scale=GYRO_FULL_SCALE_D
             dvs_rate_khz=ldvs/duration/1000
             frame_rate_hz=nfr/duration
             imu_rate_khz=limu/7/duration/1000 # divide by 7 since each IMU sample is 7 jAER events
-            log.info(f'{file_path.absolute()} is {(tot_len_jaer_events*8)>>10:n} kB size, with duration {duration:.4n}s, containing {ldvs:n} DVS events at rate {dvs_rate_khz:.4n}kHz, {limu:n} IMU samples at rate {imu_rate_khz:.4n}kHz, and {nfr:n} frames at rate {frame_rate_hz:.4n}Hz')
+            log.info(f'{file_path.absolute()} is {(tot_len_jaer_events*8)>>10:n} kB size, '
+                     f'with duration {duration:.4n}s, containing {ldvs:n} DVS events at rate {dvs_rate_khz:.4n}kHz, '
+                     f'{limu:n} IMU samples at rate {imu_rate_khz:.4n}kHz, '
+                     f'and {nfr:n} frames at rate {frame_rate_hz:.4n}Hz')
 
 # https://stackoverflow.com/questions/3041986/apt-command-line-interface-like-yes-no-input/3041990
 def query_yes_no(question, default="yes"):
